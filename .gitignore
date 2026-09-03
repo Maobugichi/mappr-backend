@@ -56,6 +56,10 @@ uploads/
 # Vercel
 .vercel/
 
+# Cookie/session files
+cookies.txt
+cookies2.txt
+
 # Misc
 .env.*
 !.env.example
