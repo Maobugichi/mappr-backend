@@ -62,10 +62,15 @@ const DesignComponentSchema = z.object({
   description: z.string(),
 });
 
+const DevelopmentPlanItemSchema = z.object({
+  description: z.string(),
+  relatedFeatures: z.array(z.string()), // must reference features[].id
+});
+
 const DevelopmentPlanPhaseSchema = z.object({
   phase: z.number().int().positive(),
   title: z.string(),
-  items: z.array(z.string()), 
+  items: z.array(DevelopmentPlanItemSchema),
 });
 
 export const MapprSystemSchema = z.object({

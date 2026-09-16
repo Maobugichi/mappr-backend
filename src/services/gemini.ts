@@ -29,6 +29,7 @@ Rules:
 - Every id you generate (for users, features, architecture nodes, data model entities) must be a short, unique, kebab-case string, referenced consistently across sections (e.g. an architecture node id used elsewhere must match exactly).
 - features[].dependsOn should reflect real technical/logical dependency ordering, since it drives the development plan.
 - developmentPlan phases must respect those dependencies — nothing should appear in an earlier phase than something it depends on.
+- Each developmentPlan item has a "description" (what to build/do) and "relatedFeatures" (which features[].id values this item implements or advances). Use the exact ids from the features section — never invent new ids or put ids inside the description text. If an item is pure setup/infra with no specific feature tie (e.g. "initialize repo", "configure CI"), relatedFeatures should be an empty array — don't force a false link.
 - techStack choices must be justified by the actual requirements of this product, not defaults.
 - Each architecture node's description should explain what that specific piece actually does in this product — real substance a developer could act on, not a restatement of the label or type.
 - designSystem should feel intentional and appropriate for this specific product's audience and tone, not generic.`;

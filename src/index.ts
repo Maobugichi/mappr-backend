@@ -6,6 +6,8 @@ import { pool } from './db/pool.js';
 import { anonSession } from './middleware/anonSession.js';
 import generateRouter from './routes/generate.js';
 import mapsRouter from './routes/maps.js';
+import critiqueRouter from './routes/critique.js';
+import requirementsRouter from './routes/requirements.js';
 
 const app = express();
 
@@ -16,6 +18,8 @@ app.use(anonSession);
 
 app.use(generateRouter);
 app.use(mapsRouter);
+app.use(critiqueRouter);
+app.use(requirementsRouter);
 
 app.get('/health', async (_req, res) => {
   try {

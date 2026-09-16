@@ -190,7 +190,17 @@ export const geminiResponseSchema = {
         properties: {
           phase: { type: Type.INTEGER },
           title: { type: Type.STRING },
-          items: { type: Type.ARRAY, items: { type: Type.STRING } },
+          items: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                description: { type: Type.STRING },
+                relatedFeatures: { type: Type.ARRAY, items: { type: Type.STRING } },
+              },
+              required: ['description', 'relatedFeatures'],
+            },
+          },
         },
         required: ['phase', 'title', 'items'],
       },
