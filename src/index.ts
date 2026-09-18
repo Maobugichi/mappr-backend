@@ -8,6 +8,7 @@ import generateRouter from './routes/generate.js';
 import mapsRouter from './routes/maps.js';
 import critiqueRouter from './routes/critique.js';
 import requirementsRouter from './routes/requirements.js';
+import iterateRouter from './routes/iterate.js';
 
 const app = express();
 
@@ -20,6 +21,7 @@ app.use(generateRouter);
 app.use(mapsRouter);
 app.use(critiqueRouter);
 app.use(requirementsRouter);
+app.use(iterateRouter);
 
 app.get('/health', async (_req, res) => {
   try {
