@@ -9,6 +9,8 @@ import mapsRouter from './routes/maps.js';
 import critiqueRouter from './routes/critique.js';
 import requirementsRouter from './routes/requirements.js';
 import iterateRouter from './routes/iterate.js';
+import diffRouter from './routes/diff.js';
+import traceabilityRouter from './routes/traceability.js';
 
 const app = express();
 
@@ -22,6 +24,8 @@ app.use(mapsRouter);
 app.use(critiqueRouter);
 app.use(requirementsRouter);
 app.use(iterateRouter);
+app.use(diffRouter);
+app.use(traceabilityRouter);
 
 app.get('/health', async (_req, res) => {
   try {
