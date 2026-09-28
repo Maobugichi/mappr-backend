@@ -1,4 +1,4 @@
-import { GoogleGenAI } from '@google/genai';
+import { AIGenerationError, generateStructured } from './aiClient.js';
 import type { ZodError } from 'zod';
 import crypto from 'node:crypto';
 import {
@@ -9,12 +9,7 @@ import {
 import type { MapprSystem } from '../schema/mapprSystem.js';
 import type { MissingRequirement } from '../schema/missingRequirement.js';
 
-if (!process.env.GEMINI_API_KEY) {
-  throw new Error('GEMINI_API_KEY is not set');
-}
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-const MODEL = process.env.GEMINI_MODEL ?? 'gemini-flash-latest';
 
 const SYSTEM_INSTRUCTIONS = `You are a senior product engineer reviewing a system's requirements for gaps. You will be given the full structured system model — product, users, features, tech stack, architecture, data model, and development plan — as JSON.
 
@@ -47,47 +42,6 @@ function buildPrompt(system: MapprSystem, retryContext?: string): string {
   return prompt;
 }
 
-async function callGemini(prompt: string): Promise<unknown> {
-  const response = await ai.models.generateContent({
-    model: MODEL,
-    contents: prompt,
-    config: {
-      responseMimeType: 'application/json',
-      responseSchema: geminiRequirementResponseSchema,
-    },
-  });
-
-  const text = response.text;
-  if (!text) {
-    throw new Error('Gemini response had no text content');
-  }
-
-  return JSON.parse(text);
-}
-
-const TRANSIENT_RETRY_DELAYS_MS = [1000, 3000];
-
-function isTransientError(err: unknown): boolean {
-  const status = (err as { status?: number } | undefined)?.status;
-  return status === 503 || status === 429;
-}
-
-async function callGeminiWithRetry(prompt: string): Promise<unknown> {
-  for (let attempt = 0; attempt <= TRANSIENT_RETRY_DELAYS_MS.length; attempt++) {
-    try {
-      return await callGemini(prompt);
-    } catch (err) {
-      const isLastAttempt = attempt === TRANSIENT_RETRY_DELAYS_MS.length;
-      if (!isTransientError(err) || isLastAttempt) {
-        throw err;
-      }
-      await new Promise((resolve) => setTimeout(resolve, TRANSIENT_RETRY_DELAYS_MS[attempt]));
-    }
-  }
-
-  throw new Error('callGeminiWithRetry exhausted attempts unexpectedly');
-}
-
 export class RequirementsReviewValidationError extends Error {
   zodError: ZodError;
 
@@ -117,21 +71,18 @@ export async function generateRequirementsReview(
 ): Promise<MissingRequirement[]> {
   const validFeatureIds = new Set(system.features.map((feature) => feature.id));
 
-  const firstAttempt = await callGeminiWithRetry(buildPrompt(system));
-  const firstResult = GeneratedRequirementsReviewSchema.safeParse(firstAttempt);
-  if (firstResult.success) {
-    return firstResult.data.findings.map((finding) => groundRequirement(finding, validFeatureIds));
+  try {
+    const generated = await generateStructured({
+      buildPrompt: (retryContext) => buildPrompt(system, retryContext),
+      zodSchema: GeneratedRequirementsReviewSchema,
+      geminiResponseSchema: geminiRequirementResponseSchema,
+      groqSchemaName: 'requirements_review',
+    });
+    return generated.findings.map((finding) => groundRequirement(finding, validFeatureIds));
+  } catch (err) {
+    if (err instanceof AIGenerationError && err.zodError) {
+      throw new RequirementsReviewValidationError(err.zodError);
+    }
+    throw err;
   }
-
-  const errorSummary = firstResult.error.issues
-    .map((issue) => `${issue.path.join('.')}: ${issue.message}`)
-    .join('\n');
-
-  const secondAttempt = await callGeminiWithRetry(buildPrompt(system, errorSummary));
-  const secondResult = GeneratedRequirementsReviewSchema.safeParse(secondAttempt);
-  if (secondResult.success) {
-    return secondResult.data.findings.map((finding) => groundRequirement(finding, validFeatureIds));
-  }
-
-  throw new RequirementsReviewValidationError(secondResult.error);
 }

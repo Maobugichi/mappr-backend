@@ -1,4 +1,4 @@
-import { GoogleGenAI } from '@google/genai';
+import { AIGenerationError, generateStructured } from './aiClient.js'
 import type { ZodError } from 'zod';
 import {
   geminiTraceabilityResponseSchema,
@@ -6,13 +6,6 @@ import {
   type TraceLink,
 } from '../schema/traceability.js';
 import type { MapprSystem } from '../schema/mapprSystem.js';
-
-if (!process.env.GEMINI_API_KEY) {
-  throw new Error('GEMINI_API_KEY is not set');
-}
-
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-const MODEL = process.env.GEMINI_MODEL ?? 'gemini-flash-latest';
 
 const SYSTEM_INSTRUCTIONS = `You are checking whether a system's stated features are actually backed by its architecture. You will be given the full structured system model as JSON.
 
@@ -34,48 +27,6 @@ function buildPrompt(system: MapprSystem, retryContext?: string): string {
 
   return prompt;
 }
-
-async function callGemini(prompt: string): Promise<unknown> {
-  const response = await ai.models.generateContent({
-    model: MODEL,
-    contents: prompt,
-    config: {
-      responseMimeType: 'application/json',
-      responseSchema: geminiTraceabilityResponseSchema,
-    },
-  });
-
-  const text = response.text;
-  if (!text) {
-    throw new Error('Gemini response had no text content');
-  }
-
-  return JSON.parse(text);
-}
-
-const TRANSIENT_RETRY_DELAYS_MS = [1000, 3000];
-
-function isTransientError(err: unknown): boolean {
-  const status = (err as { status?: number } | undefined)?.status;
-  return status === 503 || status === 429;
-}
-
-async function callGeminiWithRetry(prompt: string): Promise<unknown> {
-  for (let attempt = 0; attempt <= TRANSIENT_RETRY_DELAYS_MS.length; attempt++) {
-    try {
-      return await callGemini(prompt);
-    } catch (err) {
-      const isLastAttempt = attempt === TRANSIENT_RETRY_DELAYS_MS.length;
-      if (!isTransientError(err) || isLastAttempt) {
-        throw err;
-      }
-      await new Promise((resolve) => setTimeout(resolve, TRANSIENT_RETRY_DELAYS_MS[attempt]));
-    }
-  }
-
-  throw new Error('callGeminiWithRetry exhausted attempts unexpectedly');
-}
-
 export class TraceabilityValidationError extends Error {
   zodError: ZodError;
 
@@ -95,31 +46,29 @@ function groundLinks(
 ): TraceLink[] {
   return links
     .filter((link) => validFeatureIds.has(link.featureId))
-    .map((link) => ({
-      ...link,
-      nodeIds: link.nodeIds.filter((id) => validNodeIds.has(id)),
-    }));
+    .map(({ note, ...rest }) => {
+      const nodeIds = rest.nodeIds.filter((id) => validNodeIds.has(id));
+      
+      return note == null ? { ...rest, nodeIds } : { ...rest, nodeIds, note };
+    });
 }
 
 export async function generateTraceability(system: MapprSystem): Promise<TraceLink[]> {
   const validFeatureIds = new Set(system.features.map((f) => f.id));
   const validNodeIds = new Set(system.architecture.nodes.map((n) => n.id));
 
-  const firstAttempt = await callGeminiWithRetry(buildPrompt(system));
-  const firstResult = GeneratedTraceabilitySchema.safeParse(firstAttempt);
-  if (firstResult.success) {
-    return groundLinks(firstResult.data.links, validFeatureIds, validNodeIds);
+  try {
+    const generated = await generateStructured({
+      buildPrompt: (retryContext) => buildPrompt(system, retryContext),
+      zodSchema: GeneratedTraceabilitySchema,
+      geminiResponseSchema: geminiTraceabilityResponseSchema,
+      groqSchemaName: 'traceability',
+    });
+    return groundLinks(generated.links, validFeatureIds, validNodeIds);
+  } catch (err) {
+    if (err instanceof AIGenerationError && err.zodError) {
+      throw new TraceabilityValidationError(err.zodError);
+    }
+    throw err;
   }
-
-  const errorSummary = firstResult.error.issues
-    .map((issue) => `${issue.path.join('.')}: ${issue.message}`)
-    .join('\n');
-
-  const secondAttempt = await callGeminiWithRetry(buildPrompt(system, errorSummary));
-  const secondResult = GeneratedTraceabilitySchema.safeParse(secondAttempt);
-  if (secondResult.success) {
-    return groundLinks(secondResult.data.links, validFeatureIds, validNodeIds);
-  }
-
-  throw new TraceabilityValidationError(secondResult.error);
 }

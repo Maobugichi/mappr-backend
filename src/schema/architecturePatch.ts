@@ -15,15 +15,15 @@ const NewArchitectureNodeSchema = z.object({
 
 const UpdateArchitectureNodeSchema = z.object({
   id: z.string(),
-  label: z.string().optional(),
-  type: z.string().optional(),
-  description: z.string().optional(),
+  label: z.string().nullable().optional(),
+  type: z.string().nullable().optional(),
+  description: z.string().nullable().optional(),
 });
 
 const NewArchitectureEdgeSchema = z.object({
   from: z.string(),
   to: z.string(),
-  label: z.string().optional(),
+  label: z.string().nullable().optional(),
 });
 
 // Edges have no id in the current data model (see mapprSystem.ts), so
@@ -33,7 +33,7 @@ const NewArchitectureEdgeSchema = z.object({
 const RemoveArchitectureEdgeSchema = z.object({
   from: z.string(),
   to: z.string(),
-  label: z.string().optional(),
+  label: z.string().nullable().optional()
 });
 
 export const ArchitecturePatchSchema = z.object({

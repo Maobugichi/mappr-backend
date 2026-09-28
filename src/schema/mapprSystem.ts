@@ -36,7 +36,7 @@ const ArchitectureNodeSchema = z.object({
 const ArchitectureEdgeSchema = z.object({
   from: z.string(), 
   to: z.string(), 
-  label: z.string().optional(),
+  label: z.string().nullable().optional(),
 });
 
 const EntityFieldSchema = z.object({
@@ -54,7 +54,7 @@ const RelationSchema = z.object({
   from: z.string(), 
   to: z.string(), 
   type: z.enum(['one-to-one', 'one-to-many', 'many-to-many']),
-  label: z.string().optional(),
+  label: z.string().nullable().optional(),
 });
 
 const DesignComponentSchema = z.object({

@@ -4,7 +4,7 @@ import { Type } from '@google/genai';
 export const TraceLinkSchema = z.object({
   featureId: z.string(),
   nodeIds: z.array(z.string()),
-  note: z.string().optional(),
+  note: z.string().nullable().optional(),
 });
 
 export const GeneratedTraceabilitySchema = z.object({

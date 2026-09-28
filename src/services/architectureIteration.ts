@@ -1,4 +1,4 @@
-import { GoogleGenAI } from '@google/genai';
+import { AIGenerationError, generateStructured } from './aiClient.js';
 import type { ZodError } from 'zod';
 import {
   geminiIterationResponseSchema,
@@ -6,13 +6,6 @@ import {
   type ArchitecturePatch,
 } from '../schema/architecturePatch.js';
 import { MapprSystemSchema, type MapprSystem } from '../schema/mapprSystem.js';
-
-if (!process.env.GEMINI_API_KEY) {
-  throw new Error('GEMINI_API_KEY is not set');
-}
-
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-const MODEL = process.env.GEMINI_MODEL ?? 'gemini-flash-latest';
 
 const SYSTEM_INSTRUCTIONS = `You are modifying an existing system's architecture based on a natural-language instruction from the person who designed it. You will be given the full structured system model as JSON and a single instruction describing a change to make.
 
@@ -38,47 +31,6 @@ function buildPrompt(system: MapprSystem, instruction: string, retryContext?: st
   return prompt;
 }
 
-async function callGemini(prompt: string): Promise<unknown> {
-  const response = await ai.models.generateContent({
-    model: MODEL,
-    contents: prompt,
-    config: {
-      responseMimeType: 'application/json',
-      responseSchema: geminiIterationResponseSchema,
-    },
-  });
-
-  const text = response.text;
-  if (!text) {
-    throw new Error('Gemini response had no text content');
-  }
-
-  return JSON.parse(text);
-}
-
-const TRANSIENT_RETRY_DELAYS_MS = [1000, 3000];
-
-function isTransientError(err: unknown): boolean {
-  const status = (err as { status?: number } | undefined)?.status;
-  return status === 503 || status === 429;
-}
-
-async function callGeminiWithRetry(prompt: string): Promise<unknown> {
-  for (let attempt = 0; attempt <= TRANSIENT_RETRY_DELAYS_MS.length; attempt++) {
-    try {
-      return await callGemini(prompt);
-    } catch (err) {
-      const isLastAttempt = attempt === TRANSIENT_RETRY_DELAYS_MS.length;
-      if (!isTransientError(err) || isLastAttempt) {
-        throw err;
-      }
-      await new Promise((resolve) => setTimeout(resolve, TRANSIENT_RETRY_DELAYS_MS[attempt]));
-    }
-  }
-
-  throw new Error('callGeminiWithRetry exhausted attempts unexpectedly');
-}
-
 export class IterationValidationError extends Error {
   zodError: ZodError;
 
@@ -90,9 +42,9 @@ export class IterationValidationError extends Error {
 
 function edgeMatches(
   edge: MapprSystem['architecture']['edges'][number],
-  spec: { from: string; to: string; label?: string }
+  spec: { from: string; to: string; label?: string | null }
 ): boolean {
-  return edge.from === spec.from && edge.to === spec.to && (spec.label === undefined || edge.label === spec.label);
+  return edge.from === spec.from && edge.to === spec.to && (spec.label == null || edge.label === spec.label);
 }
 
 // Applies a patch to an architecture graph deterministically — Gemini
@@ -150,9 +102,9 @@ export function applyArchitecturePatch(
     (e) => !patch.removeEdges.some((spec) => edgeMatches(e, spec))
   );
 
-  const validAddEdges = patch.addEdges.filter(
-    (e) => finalNodeIds.has(e.from) && finalNodeIds.has(e.to)
-  );
+  const validAddEdges = patch.addEdges
+    .filter((e) => finalNodeIds.has(e.from) && finalNodeIds.has(e.to))
+    .map(({ label, ...rest }) => (label == null ? rest : { ...rest, label }));
 
   const finalEdges = [...edgesAfterRemoveEdges, ...validAddEdges];
 
@@ -172,23 +124,19 @@ export async function generateIteration(
   system: MapprSystem,
   instruction: string
 ): Promise<{ summary: string; groundedPatch: ArchitecturePatch; newSystem: MapprSystem }> {
-  const firstAttempt = await callGeminiWithRetry(buildPrompt(system, instruction));
-  const firstResult = GeneratedIterationSchema.safeParse(firstAttempt);
-
-  let generated;
-  if (firstResult.success) {
-    generated = firstResult.data;
-  } else {
-    const errorSummary = firstResult.error.issues
-      .map((issue) => `${issue.path.join('.')}: ${issue.message}`)
-      .join('\n');
-
-    const secondAttempt = await callGeminiWithRetry(buildPrompt(system, instruction, errorSummary));
-    const secondResult = GeneratedIterationSchema.safeParse(secondAttempt);
-    if (!secondResult.success) {
-      throw new IterationValidationError(secondResult.error);
+ let generated;
+  try {
+    generated = await generateStructured({
+      buildPrompt: (retryContext) => buildPrompt(system, instruction, retryContext),
+      zodSchema: GeneratedIterationSchema,
+      geminiResponseSchema: geminiIterationResponseSchema,
+      groqSchemaName: 'architecture_iteration',
+    });
+  } catch (err) {
+    if (err instanceof AIGenerationError && err.zodError) {
+      throw new IterationValidationError(err.zodError);
     }
-    generated = secondResult.data;
+    throw err;
   }
 
   const { architecture, groundedPatch } = applyArchitecturePatch(

@@ -1,14 +1,7 @@
-import { GoogleGenAI } from '@google/genai';
+import { AIGenerationError, generateStructured } from './aiClient.js';
 import type { ZodError } from 'zod';
 import { geminiResponseSchema } from '../schema/geminiResponseSchema.js';
 import { MapprSystemSchema, type MapprSystem } from '../schema/mapprSystem.js';
-
-if (!process.env.GEMINI_API_KEY) {
-  throw new Error('GEMINI_API_KEY is not set');
-}
-
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-const MODEL = process.env.GEMINI_MODEL ?? 'gemini-flash-latest';
 
 const SYSTEM_INSTRUCTIONS = `You are a senior software architect and product designer helping a founder think through a software product before they build it.
 
@@ -43,49 +36,6 @@ function buildPrompt(description: string, retryContext?: string): string {
 
   return prompt;
 }
-
-async function callGemini(prompt: string): Promise<unknown> {
-  const response = await ai.models.generateContent({
-    model: MODEL,
-    contents: prompt,
-    config: {
-      responseMimeType: 'application/json',
-      responseSchema: geminiResponseSchema,
-    },
-  });
-
-  const text = response.text;
-  if (!text) {
-    throw new Error('Gemini response had no text content');
-  }
-
-  return JSON.parse(text);
-}
-
-
-const TRANSIENT_RETRY_DELAYS_MS = [1000, 3000];
-
-function isTransientError(err: unknown): boolean {
-  const status = (err as { status?: number } | undefined)?.status;
-  return status === 503 || status === 429;
-}
-
-async function callGeminiWithRetry(prompt: string): Promise<unknown> {
-  for (let attempt = 0; attempt <= TRANSIENT_RETRY_DELAYS_MS.length; attempt++) {
-    try {
-      return await callGemini(prompt);
-    } catch (err) {
-      const isLastAttempt = attempt === TRANSIENT_RETRY_DELAYS_MS.length;
-      if (!isTransientError(err) || isLastAttempt) {
-        throw err;
-      }
-      await new Promise((resolve) => setTimeout(resolve, TRANSIENT_RETRY_DELAYS_MS[attempt]));
-    }
-  }
-  
-  throw new Error('callGeminiWithRetry exhausted attempts unexpectedly');
-}
-
 export class GenerationValidationError extends Error {
   zodError: ZodError;
 
@@ -96,22 +46,39 @@ export class GenerationValidationError extends Error {
 }
 
 
+// A null label (Groq's way of saying "no label") is dropped so the
+// stored shape stays string-or-absent, as before.
+function stripNullLabels(system: MapprSystem): MapprSystem {
+  return {
+    ...system,
+    architecture: {
+      ...system.architecture,
+      edges: system.architecture.edges.map(({ label, ...rest }) =>
+        label == null ? rest : { ...rest, label }
+      ),
+    },
+    dataModel: {
+      ...system.dataModel,
+      relations: system.dataModel.relations.map(({ label, ...rest }) =>
+        label == null ? rest : { ...rest, label }
+      ),
+    },
+  };
+}
+
 export async function generateMapprSystem(description: string): Promise<MapprSystem> {
-  const firstAttempt = await callGeminiWithRetry(buildPrompt(description));
-  const firstResult = MapprSystemSchema.safeParse(firstAttempt);
-  if (firstResult.success) {
-    return firstResult.data;
+  try {
+    const generated = await generateStructured({
+      buildPrompt: (retryContext) => buildPrompt(description, retryContext),
+      zodSchema: MapprSystemSchema,
+      geminiResponseSchema,
+      groqSchemaName: 'mappr_system',
+    });
+    return stripNullLabels(generated);
+  } catch (err) {
+    if (err instanceof AIGenerationError && err.zodError) {
+      throw new GenerationValidationError(err.zodError);
+    }
+    throw err;
   }
-
-  const errorSummary = firstResult.error.issues
-    .map((issue) => `${issue.path.join('.')}: ${issue.message}`)
-    .join('\n');
-
-  const secondAttempt = await callGeminiWithRetry(buildPrompt(description, errorSummary));
-  const secondResult = MapprSystemSchema.safeParse(secondAttempt);
-  if (secondResult.success) {
-    return secondResult.data;
-  }
-
-  throw new GenerationValidationError(secondResult.error);
 }
