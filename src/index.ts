@@ -11,6 +11,7 @@ import requirementsRouter from './routes/requirements.js';
 import iterateRouter from './routes/iterate.js';
 import diffRouter from './routes/diff.js';
 import traceabilityRouter from './routes/traceability.js';
+import apiContractRouter from './routes/apiContract.js';
 
 const app = express();
 
@@ -26,6 +27,7 @@ app.use(requirementsRouter);
 app.use(iterateRouter);
 app.use(diffRouter);
 app.use(traceabilityRouter);
+app.use(apiContractRouter);
 
 app.get('/health', async (_req, res) => {
   try {
