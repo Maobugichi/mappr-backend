@@ -12,6 +12,12 @@ import iterateRouter from './routes/iterate.js';
 import diffRouter from './routes/diff.js';
 import traceabilityRouter from './routes/traceability.js';
 import apiContractRouter from './routes/apiContract.js';
+import relationalSchemaRouter from './routes/relationalSchema.js'
+import documentSchemaRouter from './routes/documentSchema.js';
+import adrRouter from './routes/adr.js';
+import readmeRouter from './routes/readme.js';
+import envVarsRouter from './routes/envVars.js';
+import deploymentRouter from './routes/deployment.js';
 
 const app = express();
 
@@ -28,6 +34,12 @@ app.use(iterateRouter);
 app.use(diffRouter);
 app.use(traceabilityRouter);
 app.use(apiContractRouter);
+app.use(relationalSchemaRouter);
+app.use(documentSchemaRouter);
+app.use(adrRouter);
+app.use(readmeRouter);
+app.use(envVarsRouter);
+app.use(deploymentRouter);
 
 app.get('/health', async (_req, res) => {
   try {
