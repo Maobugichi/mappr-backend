@@ -10,6 +10,7 @@ import type {
   DeploymentEnvironment,
   DeploymentRecord,
 } from '../schema/deployment.js';
+import type { EnvVar } from '../schema/envVars.js';
 
 const router = Router();
 
@@ -19,6 +20,7 @@ function toRecord(row: {
   components: unknown;
   environments: unknown;
   cicd_steps: unknown;
+  migrations: string | null;
   created_at: Date;
   updated_at: Date;
 }): DeploymentRecord {
@@ -28,6 +30,7 @@ function toRecord(row: {
     components: row.components as DeploymentComponent[],
     environments: row.environments as DeploymentEnvironment[],
     cicdSteps: row.cicd_steps as string[],
+    migrations: row.migrations,
     createdAt: row.created_at.toISOString(),
     updatedAt: row.updated_at.toISOString(),
   };
@@ -47,7 +50,7 @@ async function loadSystem(mapId: string): Promise<MapprSystem | null> {
 }
 
 // GET /maps/:id/deployment — the stored plan for the map's current
-// techStack+architecture hash, if one exists. Same hash-not-version
+// techStackarchitecture hash, if one exists. Same hash-not-version
 // behavior as GET /maps/:id/adrs and /env-vars: an iteration that only
 // touched dataModel or features leaves the hash, and therefore the
 // stored plan, unchanged.
@@ -62,7 +65,7 @@ router.get('/maps/:id/deployment', async (req, res) => {
 
     const hash = techArchHash(system);
     const { rows } = await pool.query(
-      `SELECT map_id, tech_arch_hash, components, environments, cicd_steps, created_at, updated_at
+      `SELECT map_id, tech_arch_hash, components, environments, cicd_steps, migrations, created_at, updated_at
        FROM deployments WHERE map_id = $1 AND tech_arch_hash = $2`,
       [id, hash]
     );
@@ -94,7 +97,7 @@ router.get('/maps/:id/deployment/markdown', async (req, res) => {
 
     const hash = techArchHash(system);
     const { rows } = await pool.query(
-      `SELECT map_id, tech_arch_hash, components, environments, cicd_steps, created_at, updated_at
+      `SELECT map_id, tech_arch_hash, components, environments, cicd_steps, migrations, created_at, updated_at
        FROM deployments WHERE map_id = $1 AND tech_arch_hash = $2`,
       [id, hash]
     );
@@ -104,14 +107,22 @@ router.get('/maps/:id/deployment/markdown', async (req, res) => {
       return res.status(404).json({ error: 'not_found' });
     }
 
+    const { rows: envRows } = await pool.query(
+      `SELECT vars FROM env_vars WHERE map_id = $1 AND tech_arch_hash = $2`,
+      [id, hash]
+    );
+    const envVars = envRows[0] ? (envRows[0].vars as EnvVar[]) : null;
+
     const record = toRecord(row);
     const markdown = renderDeployment(
       {
         components: record.components,
         environments: record.environments,
         cicdSteps: record.cicdSteps,
+        migrations: record.migrations,
       },
-      system
+      system,
+      envVars
     );
     res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
     return res.send(markdown);
@@ -122,7 +133,7 @@ router.get('/maps/:id/deployment/markdown', async (req, res) => {
 });
 
 // POST /maps/:id/deployment — generate the plan for the map's current
-// techStack+architecture hash, overwriting any existing plan for that
+// techStackarchitecture hash, overwriting any existing plan for that
 // same hash. A plan generated for a hash that's since changed is left
 // in place, same as ADRs and env vars.
 router.post('/maps/:id/deployment', async (req, res) => {
@@ -157,17 +168,18 @@ router.post('/maps/:id/deployment', async (req, res) => {
       await client.query('BEGIN');
 
       const { rows: planRows } = await client.query(
-        `INSERT INTO deployments (map_id, tech_arch_hash, components, environments, cicd_steps)
-         VALUES ($1, $2, $3, $4, $5)
+        `INSERT INTO deployments (map_id, tech_arch_hash, components, environments, cicd_steps, migrations)
+         VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT (map_id, tech_arch_hash) DO UPDATE
-           SET components = $3, environments = $4, cicd_steps = $5, updated_at = now()
-         RETURNING map_id, tech_arch_hash, components, environments, cicd_steps, created_at, updated_at`,
+           SET components = $3, environments = $4, cicd_steps = $5, migrations = $6, updated_at = now()
+        RETURNING map_id, tech_arch_hash, components, environments, cicd_steps, migrations, created_at, updated_at`,
         [
           id,
           hash,
           JSON.stringify(plan.components),
           JSON.stringify(plan.environments),
           JSON.stringify(plan.cicdSteps),
+          plan.migrations
         ]
       );
 
