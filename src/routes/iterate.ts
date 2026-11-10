@@ -4,6 +4,8 @@ import { pool } from '../db/pool.js';
 import { generateIteration, IterationValidationError } from '../services/architectureIteration.js';
 import { checkRateLimits } from '../services/rateLimit.js';
 import { MapprSystemSchema } from '../schema/mapprSystem.js';
+import { revisionWritesEnabled, readCanonicalBase, commitArchitectureRevision,
+  CanonicalMapNotFoundError, RevisionConflictError, RevisionNotReadyError } from '../services/canonicalRevision.js';
 
 const router = Router();
 
@@ -13,7 +15,9 @@ const iterateBodySchema = z.object({
 
 // POST /maps/:id/iterate — apply a natural-language architecture change.
 //
-// Versioning: `maps.data` always holds the current version (every other
+// The default-off revision rollout uses coherent reads and guarded commits below.
+// The original path is retained only for the pre-S3B development database.
+// Versioning on that legacy path: `maps.data` always holds the current version (every other
 // view already reads from there, so nothing else needed to change).
 // `map_versions` holds full snapshots. Version 1 is backfilled lazily
 // here, the first time a map is ever iterated on — maps created before
@@ -21,6 +25,7 @@ const iterateBodySchema = z.object({
 // iteration, at which point the map's current data becomes version 1
 // and the patch becomes version 2. This avoids touching /generate.
 router.post('/maps/:id/iterate', async (req, res) => {
+  const useRevisions = revisionWritesEnabled();
   const { id } = req.params;
   const anonId = req.anonId;
 
@@ -44,6 +49,14 @@ router.post('/maps/:id/iterate', async (req, res) => {
   }
 
   try {
+    if (useRevisions) {
+      const mapId = id as string;
+      const base = await readCanonicalBase(mapId, anonId);
+      const result = await generateIteration(base.system, parsedBody.data.instruction);
+      const revision = await commitArchitectureRevision({ mapId, anonId, base, result });
+      return res.status(201).json({ mapId, version: revision, revision,
+        summary: result.summary, patch: result.groundedPatch, data: result.newSystem });
+    }
     const { rows: mapRows } = await pool.query(`SELECT id, data FROM maps WHERE id = $1`, [id]);
     const map = mapRows[0];
     if (!map) {
@@ -131,6 +144,14 @@ router.post('/maps/:id/iterate', async (req, res) => {
       client.release();
     }
   } catch (err) {
+    if (useRevisions && err instanceof CanonicalMapNotFoundError) return res.status(404).json({ error: 'not_found' });
+    if (useRevisions && err instanceof RevisionNotReadyError) {
+      return res.status(503).json({ error: 'revision_not_ready', message: err.message });
+    }
+    if (useRevisions && err instanceof RevisionConflictError) {
+      return res.status(409).json({ error: 'revision_conflict', message: err.message,
+        details: { expectedBaseRevision: err.expectedBaseRevision, currentRevision: err.currentRevision } });
+    }
     if (err instanceof IterationValidationError) {
       console.error('Iteration validation failed twice:', err.zodError.flatten());
       return res.status(502).json({
@@ -138,7 +159,8 @@ router.post('/maps/:id/iterate', async (req, res) => {
         message: "Mappr couldn't apply that change. Try rephrasing the instruction.",
       });
     }
-    console.error(err);
+    if (useRevisions) console.error('Revision-aware iteration failed');
+    else console.error(err);
     return res.status(500).json({ error: 'internal_error' });
   }
 });

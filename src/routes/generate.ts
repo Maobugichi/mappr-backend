@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { pool } from '../db/pool.js';
 import { generateMapprSystem, GenerationValidationError } from '../services/gemini.js';
 import { checkRateLimits } from '../services/rateLimit.js';
+import { createRevisionedMap, revisionWritesEnabled, RevisionNotReadyError } from '../services/canonicalRevision.js';
 
 const router = Router();
 
@@ -11,6 +12,7 @@ const requestBodySchema = z.object({
 });
 
 router.post('/generate', async (req, res) => {
+  const useRevisions = revisionWritesEnabled();
   const parsed = requestBodySchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: 'invalid_request', details: parsed.error.flatten() });
@@ -34,6 +36,10 @@ router.post('/generate', async (req, res) => {
 
   try {
     const system = await generateMapprSystem(parsed.data.description);
+
+    if (useRevisions) {
+      return res.status(201).json(await createRevisionedMap(anonId, parsed.data.description, system));
+    }
 
     const client = await pool.connect();
     try {
@@ -67,6 +73,9 @@ router.post('/generate', async (req, res) => {
       client.release();
     }
   } catch (err) {
+    if (useRevisions && err instanceof RevisionNotReadyError) {
+      return res.status(503).json({ error: 'revision_not_ready', message: err.message });
+    }
     if (err instanceof GenerationValidationError) {
       console.error('Generation validation failed twice:', err.zodError.flatten());
       return res.status(502).json({
@@ -75,7 +84,8 @@ router.post('/generate', async (req, res) => {
           "Mappr couldn't produce a valid system map for that description. Try rephrasing it with more detail.",
       });
     }
-    console.error(err);
+    if (useRevisions) console.error('Revision-aware generation failed');
+    else console.error(err);
     return res.status(500).json({ error: 'internal_error' });
   }
 });

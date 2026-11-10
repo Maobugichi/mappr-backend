@@ -12,9 +12,16 @@ function packCookie(id: string, secret: string): string {
   return `${id}.${sign(id, secret)}`;
 }
 
-function unpackCookie(raw: string, secret: string): string | null {
-  const [id, sig] = raw.split('.');
-  if (!id || !sig) return null;
+export function isUuid(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+}
+
+function unpackCookie(raw: unknown, secret: string): string | null {
+  if (typeof raw !== 'string') return null;
+  const parts = raw.split('.');
+  if (parts.length !== 2) return null;
+  const [id, sig] = parts;
+  if (!isUuid(id) || !sig || !/^[0-9a-f]{64}$/.test(sig)) return null;
 
   const expected = sign(id, secret);
   const sigBuf = Buffer.from(sig);
@@ -31,6 +38,7 @@ declare global {
   namespace Express {
     interface Request {
       anonId: string;
+      hasEstablishedAnonSession: boolean;
     }
   }
 }
@@ -46,6 +54,7 @@ export function anonSession(req: Request, res: Response, next: NextFunction) {
 
   const anonId = existingId ?? crypto.randomUUID();
   req.anonId = anonId;
+  req.hasEstablishedAnonSession = existingId !== null;
 
 
   if (!existingId) {
