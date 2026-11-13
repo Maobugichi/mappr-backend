@@ -1,3 +1,6 @@
+import { dailyAdmissionEnabled, reserveDailyAttempt, recordSuccessfulGeneration, cleanupDailyAttempt, dailyRouteError, type DailyAttempt } from '../services/dailyAdmission.js';
+import { captureArtifactSource, publishArtifact } from '../services/artifacts/provenance.js';
+import { artifactRouteError } from '../middleware/artifactReads.js';
 import { Router } from 'express';
 import { pool } from '../db/pool.js';
 import { generateDeployment, DeploymentValidationError } from '../services/deployment.js';
@@ -140,7 +143,7 @@ router.post('/maps/:id/deployment', async (req, res) => {
   const { id } = req.params;
   const anonId = req.anonId;
 
-  const rateLimitCheck = await checkRateLimits(anonId);
+  const rateLimitCheck = dailyAdmissionEnabled() ? { allowed: true as const } : await checkRateLimits(anonId);
   if (!rateLimitCheck.allowed) {
     if (rateLimitCheck.reason === 'global_limit') {
       return res.status(503).json({
@@ -154,18 +157,14 @@ router.post('/maps/:id/deployment', async (req, res) => {
     });
   }
 
+  let attempt: DailyAttempt | undefined;
   try {
-    const system = await loadSystem(id);
-    if (!system) {
-      return res.status(404).json({ error: 'not_found' });
-    }
+    const source = await captureArtifactSource(String(id).toLowerCase(), anonId, 'deployment');
+    attempt = await reserveDailyAttempt({ actorId: anonId, mapId: source.mapId, operation: source.kind, id: source.generationId });
+    const hash = source.key;
+    const plan = await generateDeployment(source.system);
 
-    const hash = techArchHash(system);
-    const plan = await generateDeployment(system);
-
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
+    const saved = await publishArtifact(source, anonId, async client => {
 
       const { rows: planRows } = await client.query(
         `INSERT INTO deployments (map_id, tech_arch_hash, components, environments, cicd_steps, migrations)
@@ -185,21 +184,15 @@ router.post('/maps/:id/deployment', async (req, res) => {
 
       // Shares the daily budget with the other AI-backed features —
       // same table, same counting logic in rateLimit.ts.
-      await client.query(`INSERT INTO generations (anon_id, map_id) VALUES ($1, $2)`, [
-        anonId,
-        id,
-      ]);
+      await recordSuccessfulGeneration(client, anonId, String(id).toLowerCase(), attempt);
 
-      await client.query('COMMIT');
-
-      return res.status(201).json(toRecord(planRows[0]));
-    } catch (err) {
-      await client.query('ROLLBACK');
-      throw err;
-    } finally {
-      client.release();
-    }
+      return planRows[0];
+    });
+    return res.status(201).json(toRecord(saved));
   } catch (err) {
+    await cleanupDailyAttempt(attempt);
+    if (dailyRouteError(res, err)) return;
+    if (artifactRouteError(res, err)) return;
     if (err instanceof DeploymentValidationError) {
       console.error('Deployment validation failed twice:', err.zodError.flatten());
       return res.status(502).json({

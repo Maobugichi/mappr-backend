@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { dailyAdmissionEnabled, reserveDailyAttempt, recordSuccessfulGeneration, cleanupDailyAttempt, dailyRouteError, type DailyAttempt } from '../services/dailyAdmission.js';
 import { z } from 'zod';
 import { pool } from '../db/pool.js';
 import { generateMapprSystem, GenerationValidationError } from '../services/gemini.js';
@@ -20,7 +21,7 @@ router.post('/generate', async (req, res) => {
 
   const anonId = req.anonId;
 
-  const rateLimitCheck = await checkRateLimits(anonId);
+  const rateLimitCheck = dailyAdmissionEnabled() ? { allowed: true as const } : await checkRateLimits(anonId);
   if (!rateLimitCheck.allowed) {
     if (rateLimitCheck.reason === 'global_limit') {
       return res.status(503).json({
@@ -34,11 +35,13 @@ router.post('/generate', async (req, res) => {
     });
   }
 
+  let attempt: DailyAttempt | undefined;
   try {
+    attempt = await reserveDailyAttempt({ actorId: anonId, operation: 'generate' });
     const system = await generateMapprSystem(parsed.data.description);
 
     if (useRevisions) {
-      return res.status(201).json(await createRevisionedMap(anonId, parsed.data.description, system));
+      return res.status(201).json(await createRevisionedMap(anonId, parsed.data.description, system, attempt));
     }
 
     const client = await pool.connect();
@@ -53,10 +56,7 @@ router.post('/generate', async (req, res) => {
       );
       const map = mapResult.rows[0];
 
-      await client.query(`INSERT INTO generations (anon_id, map_id) VALUES ($1, $2)`, [
-        anonId,
-        map.id,
-      ]);
+      await recordSuccessfulGeneration(client, anonId, map.id, attempt);
 
       await client.query('COMMIT');
 
@@ -73,6 +73,8 @@ router.post('/generate', async (req, res) => {
       client.release();
     }
   } catch (err) {
+    await cleanupDailyAttempt(attempt);
+    if (dailyRouteError(res, err)) return;
     if (useRevisions && err instanceof RevisionNotReadyError) {
       return res.status(503).json({ error: 'revision_not_ready', message: err.message });
     }

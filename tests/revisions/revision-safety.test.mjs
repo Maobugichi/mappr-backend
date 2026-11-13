@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs';
 import http from 'node:http';
 import { isDeepStrictEqual } from 'node:util';
 import test, { mock } from 'node:test';
+import { DailyFixture } from '../fixtures/daily-admission.mjs';
 
 process.env.COOKIE_SECRET = 's3a-isolated-test-secret';
 process.env.FRONTEND_ORIGIN = 'https://frontend.mappr.test';
@@ -13,6 +14,7 @@ process.env.MAPPR_REVISION_WRITES_ENABLED = 'true';
 process.env.NODE_ENV = 'test';
 delete process.env.GEMINI_API_KEY;
 delete process.env.GROQ_API_KEY;
+delete process.env.MAPPR_DAILY_ADMISSION_ENABLED;
 
 const owner = randomUUID(), other = randomUUID(), mapA = randomUUID(), mapB = randomUUID();
 const timestamp = new Date('2026-11-07T11:00:00Z');
@@ -36,6 +38,7 @@ class Database {
     this.usage = []; this.clients = new Set(); this.locks = new Map(); this.waiters = new Map();
     this.queries = []; this.commits = []; this.rollbacks = []; this.aiCalls = 0;
     this.failAt = null; this.schemaReady = true; this.pause = null; this.aiHook = null;
+    this.clock = new Date(timestamp); this.daily = new DailyFixture(this);
   }
   async connect() {
     const tx = { open: false, maps: new Map(), history: [], usage: [], locks: new Set(), attemptedWrites: 0 };
@@ -70,18 +73,20 @@ class Database {
   }
   async query(text, values = [], tx) {
     const sql = text.replace(/\s+/g, ' ').trim(); this.queries.push(sql);
-    if (sql === 'BEGIN') { assert.ok(tx); tx.open = true; return { rows: [] }; }
-    if (sql.startsWith('SET LOCAL ')) return { rows: [] };
+    if (sql === 'BEGIN') { assert.ok(tx); tx.open = true; this.daily.begin(tx); return { rows: [] }; }
+    if (sql.startsWith('SET ')) return { rows: [] };
     if (sql === 'ROLLBACK') {
-      this.rollbacks.push({ attemptedWrites: tx.attemptedWrites }); tx.open = false; this.unlock(tx); return { rows: [] };
+      this.rollbacks.push({ attemptedWrites: tx.attemptedWrites }); tx.open = false; this.daily.rollback(tx); this.unlock(tx); return { rows: [] };
     }
     if (sql === 'COMMIT') {
       this.fail('commit');
+      this.daily.commit(tx);
       for (const [id, row] of tx.maps) this.maps.set(id, copy(row));
       for (const { mapId, row } of tx.history) this.history.set(mapId, [...(this.history.get(mapId) ?? []), copy(row)]);
       this.usage.push(...copy(tx.usage)); this.commits.push({ maps: [...tx.maps.keys()], snapshots: tx.history.length, usage: tx.usage.length });
       tx.open = false; this.unlock(tx); return { rows: [] };
     }
+    const daily = await this.daily.query(sql, values, tx); if (daily) return daily;
     if (sql === 'SELECT 1 FROM maps WHERE id = $1 AND anon_id = $2') {
       return { rows: this.maps.get(values[0])?.anon_id === values[1] ? [{}] : [] };
     }
@@ -130,7 +135,7 @@ mock.module('pg', { namedExports: { Pool: class { constructor() { throw new Erro
 mock.module(new URL('../../src/db/pool.ts', import.meta.url).href, { namedExports: {
   pool: { query: (...args) => db.query(...args), connect: () => db.connect() },
 } });
-mock.module(new URL('../../src/services/rateLimit.ts', import.meta.url).href, { namedExports: { checkRateLimits: async () => ({ allowed: true }) } });
+mock.module(new URL('../../src/services/rateLimit.ts', import.meta.url).href, { namedExports: { FREE_DAILY_LIMIT: 2, GLOBAL_DAILY_CEILING: 200, checkRateLimits: async () => ({ allowed: true }) } });
 class AIGenerationError extends Error {}
 mock.module(new URL('../../src/services/aiClient.ts', import.meta.url).href, { namedExports: {
   AIGenerationError,
@@ -285,6 +290,23 @@ test('S3A prepared migration is expansion-only and is never executed by this sui
   assert.match(sql, /ALTER TABLE public\.maps ADD COLUMN current_revision integer;/);
   assert.doesNotMatch(sql, /\b(?:DEFAULT|NOT NULL|UPDATE|INSERT|DELETE|DROP|CREATE TABLE|CHECK)\b/i);
   assert.match(sql, /lock_timeout/); assert.match(sql, /statement_timeout/);
+});
+
+test('S4D real generation and Architecture POSTs share durable admission and preserve response/revision contracts',async t=>{
+  process.env.MAPPR_DAILY_ADMISSION_ENABLED='true';t.after(()=>delete process.env.MAPPR_DAILY_ADMISSION_ENABLED);
+  db=new Database();const server=createApp().listen(0,'127.0.0.1');await once(server,'listening');
+  t.after(async()=>{server.closeAllConnections();await new Promise(done=>server.close(done));});
+  const cookie=`mappr_anon=${owner}.${createHmac('sha256',process.env.COOKIE_SECRET).update(owner).digest('hex')}`;
+  async function post(path,body){const response=await fetch(`http://127.0.0.1:${server.address().port}${path}`,{method:'POST',
+    headers:{Cookie:cookie,Origin:process.env.FRONTEND_ORIGIN,'Content-Type':'application/json'},body:JSON.stringify(body)});return {status:response.status,data:await response.json()};}
+  db.aiHook=async()=>assert.equal(db.daily.locks.size,0,'No quota lock during provider');
+  const generated=await post('/generate',{description:'A sufficiently long daily allowance fixture.'});assert.equal(generated.status,201);assert.equal(generated.data.revision,1);
+  const iterated=await post(`/maps/${mapA}/iterate`,{instruction:'Add alpha.'});assert.equal(iterated.status,201);assert.equal(iterated.data.revision,2);
+  assert.deepEqual(Object.keys(iterated.data).sort(),['mapId','version','revision','summary','patch','data'].sort());
+  const denied=await post('/generate',{description:'A sufficiently long third generation attempt.'});assert.equal(denied.status,429);
+  assert.equal(denied.data.error,'daily_limit_exceeded');assert.equal(db.aiCalls,2);assert.equal(db.usage.length,2);
+  assert.deepEqual([...db.daily.attempts.values()].map(a=>a.state),['succeeded','succeeded']);
+  assert.equal(db.clients.size,0);assert.equal(db.daily.locks.size,0);assert.equal(db.locks.size,0);
 });
 
 test('S3A pure backfill planner covers reviewed initialization, restart, and quarantine without running backfill', async t => {

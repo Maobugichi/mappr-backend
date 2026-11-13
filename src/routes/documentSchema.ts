@@ -1,3 +1,6 @@
+import { dailyAdmissionEnabled, reserveDailyAttempt, recordSuccessfulGeneration, cleanupDailyAttempt, dailyRouteError, type DailyAttempt } from '../services/dailyAdmission.js';
+import { captureArtifactSource, publishArtifact } from '../services/artifacts/provenance.js';
+import { artifactRouteError } from '../middleware/artifactReads.js';
 import { Router } from 'express';
 import { pool } from '../db/pool.js';
 import { generateDocumentSchema, DocumentSchemaValidationError } from '../services/documentSchema.js';
@@ -100,7 +103,7 @@ router.post('/maps/:id/document-schema', async (req, res) => {
   const { id } = req.params;
   const anonId = req.anonId;
 
-  const rateLimitCheck = await checkRateLimits(anonId);
+  const rateLimitCheck = dailyAdmissionEnabled() ? { allowed: true as const } : await checkRateLimits(anonId);
   if (!rateLimitCheck.allowed) {
     if (rateLimitCheck.reason === 'global_limit') {
       return res.status(503).json({
@@ -114,25 +117,14 @@ router.post('/maps/:id/document-schema', async (req, res) => {
     });
   }
 
+  let attempt: DailyAttempt | undefined;
   try {
-    const { rows: mapRows } = await pool.query(`SELECT id, data FROM maps WHERE id = $1`, [id]);
-    const map = mapRows[0];
-    if (!map) {
-      return res.status(404).json({ error: 'not_found' });
-    }
+    const source = await captureArtifactSource(String(id).toLowerCase(), anonId, 'document_schema');
+    attempt = await reserveDailyAttempt({ actorId: anonId, mapId: source.mapId, operation: source.kind, id: source.generationId });
+    const version = source.revision;
+    const collections = await generateDocumentSchema(source.system);
 
-    const systemParse = MapprSystemSchema.safeParse(map.data);
-    if (!systemParse.success) {
-      console.error('Stored map failed MapprSystem validation:', systemParse.error.flatten());
-      return res.status(500).json({ error: 'internal_error' });
-    }
-
-    const version = await currentVersion(id);
-    const collections = await generateDocumentSchema(systemParse.data);
-
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
+    const saved = await publishArtifact(source, anonId, async client => {
 
       const { rows: schemaRows } = await client.query(
         `INSERT INTO document_schemas (map_id, version, collections)
@@ -144,21 +136,15 @@ router.post('/maps/:id/document-schema', async (req, res) => {
 
       // Shares the daily budget with the other AI-backed features —
       // same table, same counting logic in rateLimit.ts.
-      await client.query(`INSERT INTO generations (anon_id, map_id) VALUES ($1, $2)`, [
-        anonId,
-        id,
-      ]);
+      await recordSuccessfulGeneration(client, anonId, String(id).toLowerCase(), attempt);
 
-      await client.query('COMMIT');
-
-      return res.status(201).json(toRecord(schemaRows[0]));
-    } catch (err) {
-      await client.query('ROLLBACK');
-      throw err;
-    } finally {
-      client.release();
-    }
+      return schemaRows[0];
+    });
+    return res.status(201).json(toRecord(saved));
   } catch (err) {
+    await cleanupDailyAttempt(attempt);
+    if (dailyRouteError(res, err)) return;
+    if (artifactRouteError(res, err)) return;
     if (err instanceof DocumentSchemaValidationError) {
       console.error('Document schema validation failed twice:', err.zodError.flatten());
       return res.status(502).json({

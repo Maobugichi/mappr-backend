@@ -4,6 +4,7 @@ import { revisionTransaction } from '../db/revisionTransaction.js';
 import { MapprSystemSchema, type MapprSystem } from '../schema/mapprSystem.js';
 import type { ArchitecturePatch } from '../schema/architecturePatch.js';
 import { isRevision, MAX_REVISION } from './revisionState.js';
+import { recordSuccessfulGeneration, type DailyAttempt } from './dailyAdmission.js';
 
 // Default off until S3B has paused ALL canonical writers, applied expansion,
 // completed reviewed backfill, and coordinated every instance's rollout.
@@ -50,9 +51,9 @@ function schemaFailure(error: unknown): never {
   throw error;
 }
 
-export async function readRevisionedMap(mapId: string): Promise<RevisionedMap> {
+export async function readRevisionedMap(mapId: string, database: Pick<PoolClient, 'query'> = pool): Promise<RevisionedMap> {
   try {
-    const { rows } = await pool.query<RevisionedMap>(mapRead, [mapId]);
+    const { rows } = await database.query<RevisionedMap>(mapRead, [mapId]);
     const row = rows[0];
     if (!row) throw new CanonicalMapNotFoundError();
     ready(row);
@@ -73,12 +74,7 @@ async function snapshot(client: PoolClient, mapId: string, version: number, data
   if (written.rowCount !== 1) throw new Error('Canonical snapshot was not written');
 }
 
-async function usage(client: PoolClient, anonId: string, mapId: string) {
-  const written = await client.query('INSERT INTO generations (anon_id, map_id) VALUES ($1, $2)', [anonId, mapId]);
-  if (written.rowCount !== 1) throw new Error('Canonical usage was not written');
-}
-
-export async function createRevisionedMap(anonId: string, description: string, data: MapprSystem) {
+export async function createRevisionedMap(anonId: string, description: string, data: MapprSystem, attempt?: DailyAttempt) {
   if (!MapprSystemSchema.safeParse(data).success) throw new RevisionNotReadyError();
   try {
     return await revisionTransaction(pool, async client => {
@@ -87,7 +83,7 @@ export async function createRevisionedMap(anonId: string, description: string, d
       const map = rows[0];
       if (!map || rows.length !== 1) throw new Error('Canonical map was not created');
       await snapshot(client, map.id, 1, data, null, 'Initial generation');
-      await usage(client, anonId, map.id);
+      await recordSuccessfulGeneration(client, anonId, map.id, attempt);
       return { id: map.id as string, createdAt: map.created_at as Date, updatedAt: map.updated_at as Date, data, revision: 1 };
     });
   } catch (error) { return schemaFailure(error); }
@@ -96,6 +92,7 @@ export async function createRevisionedMap(anonId: string, description: string, d
 export async function commitArchitectureRevision(input: {
   mapId: string; anonId: string; base: CanonicalBase;
   result: { newSystem: MapprSystem; groundedPatch: ArchitecturePatch; summary: string };
+  attempt?: DailyAttempt;
 }): Promise<number> {
   if (!MapprSystemSchema.safeParse(input.result.newSystem).success) throw new RevisionNotReadyError();
   try {
@@ -118,7 +115,7 @@ export async function commitArchitectureRevision(input: {
       const updated = await client.query('UPDATE maps SET data = $1, current_revision = $2, updated_at = now() WHERE id = $3',
         [JSON.stringify(input.result.newSystem), revision, input.mapId]);
       if (updated.rowCount !== 1) throw new Error('Canonical map was not updated');
-      await usage(client, input.anonId, input.mapId);
+      await recordSuccessfulGeneration(client, input.anonId, input.mapId, input.attempt);
       return revision;
     });
   } catch (error) { return schemaFailure(error); }

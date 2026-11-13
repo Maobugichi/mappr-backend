@@ -1,6 +1,7 @@
 import { GoogleGenAI } from '@google/genai';
 import Groq from 'groq-sdk';
 import { z, type ZodError, type ZodType } from 'zod';
+import { aiRetryDelay, throwIfCancelled, withAISignal } from './aiCancellation.js';
 
 if (!process.env.GEMINI_API_KEY) {
   throw new Error('GEMINI_API_KEY is not set');
@@ -69,17 +70,22 @@ function errorSummaryFrom(zodError: ZodError): string {
 
 async function callWithTransientRetry(
   call: (prompt: string) => Promise<unknown>,
-  prompt: string
+  prompt: string,
+  signal?: AbortSignal
 ): Promise<unknown> {
   for (let attempt = 0; attempt <= TRANSIENT_RETRY_DELAYS_MS.length; attempt++) {
     try {
-      return await call(prompt);
+      throwIfCancelled(signal);
+      const output = await withAISignal(call(prompt), signal);
+      throwIfCancelled(signal);
+      return output;
     } catch (err) {
+      throwIfCancelled(signal);
       const isLastAttempt = attempt === TRANSIENT_RETRY_DELAYS_MS.length;
       if (!isTransientError(err) || isLastAttempt) {
         throw err;
       }
-      await new Promise((resolve) => setTimeout(resolve, TRANSIENT_RETRY_DELAYS_MS[attempt]));
+      await aiRetryDelay(TRANSIENT_RETRY_DELAYS_MS[attempt], signal);
     }
   }
 
@@ -109,9 +115,11 @@ function forceRequiredForStrictMode(schema: unknown): unknown {
 async function validateWithOneRetry<T>(
   buildPrompt: (retryContext?: string) => string,
   call: (prompt: string) => Promise<unknown>,
-  zodSchema: ZodType<T>
+  zodSchema: ZodType<T>,
+  signal?: AbortSignal
 ): Promise<{ success: true; data: T } | { success: false; error: ZodError }> {
-  const firstAttempt = await callWithTransientRetry(call, buildPrompt());
+  throwIfCancelled(signal);
+  const firstAttempt = await callWithTransientRetry(call, buildPrompt(), signal);
   const firstResult = zodSchema.safeParse(firstAttempt);
   if (firstResult.success) {
     return { success: true, data: firstResult.data };
@@ -119,7 +127,7 @@ async function validateWithOneRetry<T>(
 
   const secondAttempt = await callWithTransientRetry(
     call,
-    buildPrompt(errorSummaryFrom(firstResult.error))
+    buildPrompt(errorSummaryFrom(firstResult.error)), signal
   );
   const secondResult = zodSchema.safeParse(secondAttempt);
   if (secondResult.success) {
@@ -129,13 +137,15 @@ async function validateWithOneRetry<T>(
   return { success: false, error: secondResult.error };
 }
 
-async function callGemini(prompt: string, geminiResponseSchema: object): Promise<unknown> {
+async function callGemini(prompt: string, geminiResponseSchema: object, signal?: AbortSignal): Promise<unknown> {
+  throwIfCancelled(signal);
   const response = await gemini.models.generateContent({
     model: GEMINI_MODEL,
     contents: prompt,
     config: {
       responseMimeType: 'application/json',
       responseSchema: geminiResponseSchema,
+      ...(signal ? { abortSignal: signal, httpOptions: { retryOptions: { attempts: 1 } } } : {}),
     },
   });
 
@@ -151,8 +161,10 @@ async function callGroq(
   prompt: string,
   model: string,
   groqSchema: Record<string, unknown>,
-  schemaName: string
+  schemaName: string,
+  signal?: AbortSignal
 ): Promise<unknown> {
+  throwIfCancelled(signal);
   const response = await groq.chat.completions.create({
     model,
     messages: [{ role: 'user', content: prompt }],
@@ -162,7 +174,7 @@ async function callGroq(
       type: 'json_schema',
       json_schema: { name: schemaName, strict: true, schema: groqSchema },
     },
-  });
+  }, signal ? { signal, maxRetries: 0 } : undefined);
 
   const text = response.choices[0]?.message?.content;
   if (!text) {
@@ -173,6 +185,9 @@ async function callGroq(
 }
 
 export interface GenerateStructuredConfig<T> {
+  // Opt-in for bounded previews; legacy callers retain SDK defaults/logging.
+  signal?: AbortSignal;
+  redactErrors?: boolean;
   // Same signature every service's existing buildPrompt already has —
   // called with no args for the first attempt, and with an error
   // summary string to retry the same provider once.
@@ -187,6 +202,7 @@ export interface GenerateStructuredConfig<T> {
 }
 
 export async function generateStructured<T>(config: GenerateStructuredConfig<T>): Promise<T> {
+  throwIfCancelled(config.signal);
   const { buildPrompt, zodSchema, geminiResponseSchema, groqSchemaName } = config;
 
   // Derived from the zod schema, then normalized so every object lists
@@ -200,33 +216,40 @@ export async function generateStructured<T>(config: GenerateStructuredConfig<T>)
   try {
     const result = await validateWithOneRetry(
       buildPrompt,
-      (prompt) => callGemini(prompt, geminiResponseSchema),
-      zodSchema
+      (prompt) => callGemini(prompt, geminiResponseSchema, config.signal),
+      zodSchema, config.signal
     );
     if (result.success) {
       return result.data;
     }
     lastValidationError = result.error;
-    console.error(`[aiClient] Gemini (${GEMINI_MODEL}) returned invalid output:`, result.error.issues);
-    } catch (err) {
-       console.error(`[aiClient] Gemini (${GEMINI_MODEL}) failed: ${describeError(err)}`);
-    }
+    if (config.redactErrors) console.error('[aiClient] Gemini output rejected');
+    else console.error(`[aiClient] Gemini (${GEMINI_MODEL}) returned invalid output:`, result.error.issues);
+  } catch (err) {
+    throwIfCancelled(config.signal);
+    if (config.redactErrors) console.error('[aiClient] Gemini request failed');
+    else console.error(`[aiClient] Gemini (${GEMINI_MODEL}) failed: ${describeError(err)}`);
+  }
 
   for (const model of GROQ_FALLBACK_MODELS) {
+    throwIfCancelled(config.signal);
     try {
       const result = await validateWithOneRetry(
         buildPrompt,
-        (prompt) => callGroq(prompt, model, groqSchema, groqSchemaName),
-        zodSchema
+        (prompt) => callGroq(prompt, model, groqSchema, groqSchemaName, config.signal),
+        zodSchema, config.signal
       );
       if (result.success) {
         return result.data;
       }
       lastValidationError = result.error;
-        console.error(`[aiClient] Groq (${model}) returned invalid output:`, result.error.issues);
-        } catch (err) {
-            console.error(`[aiClient] Groq (${model}) failed: ${describeError(err)}`);
-        }
+      if (config.redactErrors) console.error('[aiClient] Groq output rejected');
+      else console.error(`[aiClient] Groq (${model}) returned invalid output:`, result.error.issues);
+    } catch (err) {
+      throwIfCancelled(config.signal);
+      if (config.redactErrors) console.error('[aiClient] Groq request failed');
+      else console.error(`[aiClient] Groq (${model}) failed: ${describeError(err)}`);
+    }
   }
 
   throw new AIGenerationError(

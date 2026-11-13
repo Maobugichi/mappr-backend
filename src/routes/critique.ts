@@ -1,3 +1,6 @@
+import { dailyAdmissionEnabled, reserveDailyAttempt, recordSuccessfulGeneration, cleanupDailyAttempt, dailyRouteError, type DailyAttempt } from '../services/dailyAdmission.js';
+import { captureArtifactSource, publishArtifact, editReviewArtifact } from '../services/artifacts/provenance.js';
+import { artifactRouteError } from '../middleware/artifactReads.js';
 import { Router } from 'express';
 import { z } from 'zod';
 import { pool } from '../db/pool.js';
@@ -49,7 +52,7 @@ router.post('/maps/:id/critique', async (req, res) => {
   const { id } = req.params;
   const anonId = req.anonId;
 
-  const rateLimitCheck = await checkRateLimits(anonId);
+  const rateLimitCheck = dailyAdmissionEnabled() ? { allowed: true as const } : await checkRateLimits(anonId);
   if (!rateLimitCheck.allowed) {
     if (rateLimitCheck.reason === 'global_limit') {
       return res.status(503).json({
@@ -63,24 +66,13 @@ router.post('/maps/:id/critique', async (req, res) => {
     });
   }
 
+  let attempt: DailyAttempt | undefined;
   try {
-    const { rows: mapRows } = await pool.query(`SELECT id, data FROM maps WHERE id = $1`, [id]);
-    const map = mapRows[0];
-    if (!map) {
-      return res.status(404).json({ error: 'not_found' });
-    }
+    const source = await captureArtifactSource(String(id).toLowerCase(), anonId, 'critique');
+    attempt = await reserveDailyAttempt({ actorId: anonId, mapId: source.mapId, operation: source.kind, id: source.generationId });
+    const findings = await generateArchitectureReview(source.system);
 
-    const systemParse = MapprSystemSchema.safeParse(map.data);
-    if (!systemParse.success) {
-      console.error('Stored map failed MapprSystem validation:', systemParse.error.flatten());
-      return res.status(500).json({ error: 'internal_error' });
-    }
-
-    const findings = await generateArchitectureReview(systemParse.data);
-
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
+    const saved = await publishArtifact(source, anonId, async client => {
 
       const { rows: reviewRows } = await client.query(
         `INSERT INTO architecture_reviews (map_id, findings)
@@ -93,21 +85,15 @@ router.post('/maps/:id/critique', async (req, res) => {
       // Counts against the same daily budget as /generate — inserted
       // into the same table that rateLimit.ts already counts from, so
       // no change to the rate-limiting logic itself is needed.
-      await client.query(`INSERT INTO generations (anon_id, map_id) VALUES ($1, $2)`, [
-        anonId,
-        id,
-      ]);
+      await recordSuccessfulGeneration(client, anonId, String(id).toLowerCase(), attempt);
 
-      await client.query('COMMIT');
-
-      return res.status(201).json(toReview(reviewRows[0]));
-    } catch (err) {
-      await client.query('ROLLBACK');
-      throw err;
-    } finally {
-      client.release();
-    }
+      return reviewRows[0];
+    });
+    return res.status(201).json(toReview(saved));
   } catch (err) {
+    await cleanupDailyAttempt(attempt);
+    if (dailyRouteError(res, err)) return;
+    if (artifactRouteError(res, err)) return;
     if (err instanceof ReviewValidationError) {
       console.error('Review validation failed twice:', err.zodError.flatten());
       return res.status(502).json({
@@ -134,7 +120,8 @@ router.patch('/maps/:id/critique/findings/:findingId', async (req, res) => {
   }
 
   try {
-    const { rows } = await pool.query(
+    const row = await editReviewArtifact(String(id).toLowerCase(), req.anonId, 'critique', async client => {
+      const { rows } = await client.query(
       `UPDATE architecture_reviews
        SET findings = (
          SELECT jsonb_agg(
@@ -150,13 +137,15 @@ router.patch('/maps/:id/critique/findings/:findingId', async (req, res) => {
       [id, parsed.data.dismissed, findingId]
     );
 
-    const row = rows[0];
+      return rows[0];
+    });
     if (!row) {
       return res.status(404).json({ error: 'not_found' });
     }
 
     return res.json(toReview(row));
   } catch (err) {
+    if (artifactRouteError(res, err)) return;
     console.error(err);
     return res.status(500).json({ error: 'internal_error' });
   }

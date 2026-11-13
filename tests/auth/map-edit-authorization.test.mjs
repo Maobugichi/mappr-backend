@@ -75,7 +75,7 @@ async function query(text, values = []) {
     return { rows: [row] };
   }
   if (sql.startsWith('INSERT INTO generations ')) {
-    state.writes++; state.usage.push({ anonId: values[0], mapId: values[1] }); return { rows: [] };
+    state.writes++; state.usage.push({ anonId: values[0], mapId: values[1] }); return { rows: [], rowCount: 1 };
   }
   if (sql.startsWith('INSERT INTO map_versions ')) {
     state.writes++; state.version = Number(values[1]); return { rows: [] };
@@ -111,7 +111,7 @@ async function query(text, values = []) {
 
 mock.module('pg', { namedExports: { Pool: class { constructor() { throw new Error('Real database initialization is forbidden in S2 tests'); } } } });
 mock.module(new URL('../../src/db/pool.ts', import.meta.url).href, { namedExports: { pool: { query, connect: async () => ({ query, release() {} }) } } });
-mock.module(new URL('../../src/services/rateLimit.ts', import.meta.url).href, { namedExports: { checkRateLimits: async () => { state.quotaChecks++; return { allowed: true }; } } });
+mock.module(new URL('../../src/services/rateLimit.ts', import.meta.url).href, { namedExports: { FREE_DAILY_LIMIT: 2, GLOBAL_DAILY_CEILING: 200, checkRateLimits: async () => { state.quotaChecks++; return { allowed: true }; } } });
 class AIGenerationError extends Error {}
 mock.module(new URL('../../src/services/aiClient.ts', import.meta.url).href, { namedExports: {
   AIGenerationError,
@@ -129,6 +129,21 @@ mock.module(new URL('../../src/services/aiClient.ts', import.meta.url).href, { n
   },
 } });
 
+// This suite isolates S2 authorization/legacy serialization from S5 storage.
+// The S5 suite exercises the real provenance helper and export middleware.
+mock.module(new URL('../../src/services/artifacts/provenance.ts', import.meta.url).href, { namedExports: {
+  artifactInventory: async () => ({ artifactFreshness: {}, artifactImpacts: [] }),
+  captureArtifactSource: async (id, actorId, kind) => ({ mapId: id, actorId, kind, system: state.maps.get(id).data,
+    revision: state.version, key: hash }),
+  publishArtifact: async (_source, _actorId, work) => {
+    await query('BEGIN'); try { const result = await work({ query }); await query('COMMIT'); return result; }
+    catch (error) { await query('ROLLBACK'); throw error; }
+  },
+  editReviewArtifact: async (_id, _actor, _kind, work) => work({ query }),
+} });
+mock.module(new URL('../../src/middleware/artifactReads.ts', import.meta.url).href, { namedExports: {
+  artifactReadMiddleware: (_req, _res, next) => next(), artifactRouteError: () => false,
+} });
 const { createApp } = await import('../../src/app.ts');
 const { mutationOrigin } = await import('../../src/middleware/mutationOrigin.ts');
 const signCookie = id => `${id}.${createHmac('sha256', process.env.COOKIE_SECRET).update(id).digest('hex')}`;
@@ -187,7 +202,10 @@ test('S2 real-router authorization with isolated database/provider mocks', { tim
   await t.test('inventory includes every current existing-map mutation', () => {
     const routes = new URL('../../src/routes/', import.meta.url);
     const found = readdirSync(routes).flatMap(name => [...readFileSync(new URL(name, routes), 'utf8').matchAll(/router\.(post|patch|put|delete)\('\/maps\/:id\/([^']+)'/g)].map(match => `${match[1].toUpperCase()} ${match[2].replace(':findingId','test-finding')}`));
-    assert.deepEqual(found.sort(), mutations.map(([method, suffix]) => `${method} ${suffix}`).sort());
+    // New proposal routes are exercised with the same central guard in the S4A
+    // suite; the existing legacy success-contract inventory remains unchanged.
+    assert.deepEqual(found.sort(), [...mutations.map(([method, suffix]) => `${method} ${suffix}`),
+      'POST changes/preview', 'POST changes/:proposalId/apply', 'POST changes/:proposalId/reject'].sort());
   });
 
   for (const [method, suffix, body, keys] of mutations) {

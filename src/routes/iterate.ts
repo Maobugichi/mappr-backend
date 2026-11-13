@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { dailyAdmissionEnabled, reserveDailyAttempt, recordSuccessfulGeneration, cleanupDailyAttempt, dailyRouteError, type DailyAttempt } from '../services/dailyAdmission.js';
 import { z } from 'zod';
 import { pool } from '../db/pool.js';
 import { generateIteration, IterationValidationError } from '../services/architectureIteration.js';
@@ -34,7 +35,7 @@ router.post('/maps/:id/iterate', async (req, res) => {
     return res.status(400).json({ error: 'invalid_request', details: parsedBody.error.flatten() });
   }
 
-  const rateLimitCheck = await checkRateLimits(anonId);
+  const rateLimitCheck = dailyAdmissionEnabled() ? { allowed: true as const } : await checkRateLimits(anonId);
   if (!rateLimitCheck.allowed) {
     if (rateLimitCheck.reason === 'global_limit') {
       return res.status(503).json({
@@ -48,12 +49,14 @@ router.post('/maps/:id/iterate', async (req, res) => {
     });
   }
 
+  let attempt: DailyAttempt | undefined;
   try {
     if (useRevisions) {
       const mapId = id as string;
       const base = await readCanonicalBase(mapId, anonId);
+      attempt = await reserveDailyAttempt({ actorId: anonId, mapId, operation: 'iterate' });
       const result = await generateIteration(base.system, parsedBody.data.instruction);
-      const revision = await commitArchitectureRevision({ mapId, anonId, base, result });
+      const revision = await commitArchitectureRevision({ mapId, anonId, base, result, attempt });
       return res.status(201).json({ mapId, version: revision, revision,
         summary: result.summary, patch: result.groundedPatch, data: result.newSystem });
     }
@@ -74,6 +77,7 @@ router.post('/maps/:id/iterate', async (req, res) => {
     // API call would be wasteful and risks exhausting the pool under
     // load. Only the actual writes below need a dedicated client (for
     // the transaction).
+    attempt = await reserveDailyAttempt({ actorId: anonId, mapId: String(id).toLowerCase(), operation: 'iterate' });
     const result = await generateIteration(systemParse.data, parsedBody.data.instruction);
 
     const client = await pool.connect();
@@ -123,10 +127,7 @@ router.post('/maps/:id/iterate', async (req, res) => {
         id,
       ]);
 
-      await client.query(`INSERT INTO generations (anon_id, map_id) VALUES ($1, $2)`, [
-        anonId,
-        id,
-      ]);
+      await recordSuccessfulGeneration(client, anonId, String(id).toLowerCase(), attempt);
 
       await client.query('COMMIT');
 
@@ -144,6 +145,8 @@ router.post('/maps/:id/iterate', async (req, res) => {
       client.release();
     }
   } catch (err) {
+    await cleanupDailyAttempt(attempt);
+    if (dailyRouteError(res, err)) return;
     if (useRevisions && err instanceof CanonicalMapNotFoundError) return res.status(404).json({ error: 'not_found' });
     if (useRevisions && err instanceof RevisionNotReadyError) {
       return res.status(503).json({ error: 'revision_not_ready', message: err.message });
